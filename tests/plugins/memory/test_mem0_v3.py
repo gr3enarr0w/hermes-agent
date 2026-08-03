@@ -620,3 +620,186 @@ class TestSelfHostedConfig:
         monkeypatch.delenv("MEM0_HOST", raising=False)
         monkeypatch.setenv("MEM0_MODE", "platform")
         assert Mem0MemoryProvider().is_available() is False
+
+
+# ---------------------------------------------------------------------------
+# on_pre_compress tests
+# ---------------------------------------------------------------------------
+
+class TestOnPreCompress:
+    """Tests for Mem0MemoryProvider.on_pre_compress.
+
+    Three contracts are verified:
+      1. Truncation fires on oversized tool content and mutates in-place.
+      2. A background extraction thread is launched when tool content > 500 chars.
+      3. Backend-is-None short-circuits without launching any thread.
+    """
+
+    _THRESHOLD = 8_000   # matches _TOOL_TRUNCATE_THRESHOLD in on_pre_compress
+    _MIN_EXTRACT = 501   # one char above the 500-char extraction trigger
+
+    def _make_provider(self, monkeypatch, backend=None):
+        provider = Mem0MemoryProvider()
+        provider.initialize("test-session")
+        provider._user_id = "u1"
+        provider._agent_id = "hermes"
+        provider._backend = backend
+        return provider
+
+    # ------------------------------------------------------------------
+    # 1. Truncation fires and modifies content in-place
+    # ------------------------------------------------------------------
+
+    def test_truncation_fires_on_oversized_tool_content(self, monkeypatch):
+        """Tool message content > _THRESHOLD is truncated in-place."""
+        provider = self._make_provider(monkeypatch, backend=None)
+        big_content = "x" * (self._THRESHOLD + 1)
+        msg = {"role": "tool", "content": big_content}
+        provider.on_pre_compress([msg])
+        assert len(msg["content"]) < len(big_content), (
+            "Content should have been truncated in-place"
+        )
+        assert "[truncated" in msg["content"], (
+            "Truncated sentinel should appear in the modified content"
+        )
+
+    def test_truncation_preserves_head_and_tail(self, monkeypatch):
+        """Truncated content begins with the first 500 chars and ends with the last 200 chars."""
+        _HEAD = 500
+        _TAIL = 200
+        provider = self._make_provider(monkeypatch, backend=None)
+        head = "H" * _HEAD
+        body = "M" * (self._THRESHOLD - _HEAD - _TAIL + 1)
+        tail = "T" * _TAIL
+        big_content = head + body + tail
+        msg = {"role": "tool", "content": big_content}
+        provider.on_pre_compress([msg])
+        assert msg["content"].startswith(head), "Head chars must be preserved"
+        assert msg["content"].endswith(tail), "Tail chars must be preserved"
+
+    def test_truncation_does_not_touch_non_tool_messages(self, monkeypatch):
+        """User/assistant messages are never truncated, even if very large."""
+        provider = self._make_provider(monkeypatch, backend=None)
+        big_content = "y" * (self._THRESHOLD + 1)
+        user_msg = {"role": "user", "content": big_content}
+        assistant_msg = {"role": "assistant", "content": big_content}
+        provider.on_pre_compress([user_msg, assistant_msg])
+        assert user_msg["content"] == big_content, "User message must not be modified"
+        assert assistant_msg["content"] == big_content, "Assistant message must not be modified"
+
+    def test_short_tool_content_not_truncated(self, monkeypatch):
+        """Tool messages below the threshold are left intact."""
+        provider = self._make_provider(monkeypatch, backend=None)
+        short_content = "short tool output"
+        msg = {"role": "tool", "content": short_content}
+        provider.on_pre_compress([msg])
+        assert msg["content"] == short_content
+
+    # ------------------------------------------------------------------
+    # 2. Extraction thread is launched when tool content > 500 chars
+    # ------------------------------------------------------------------
+
+    def test_extraction_thread_launched_for_large_tool_content(self, monkeypatch):
+        """When backend is set and a tool message exceeds 500 chars,
+        a background thread named 'mem0-pre-compress' is started."""
+        import threading
+
+        backend = FakeBackend()
+        provider = self._make_provider(monkeypatch, backend=backend)
+
+        large_content = "Z" * self._MIN_EXTRACT
+        messages = [{"role": "tool", "content": large_content}]
+
+        launched: list[threading.Thread] = []
+        original_start = threading.Thread.start
+
+        def capturing_start(self_thread):
+            launched.append(self_thread)
+            original_start(self_thread)
+
+        monkeypatch.setattr(threading.Thread, "start", capturing_start)
+
+        provider.on_pre_compress(messages)
+
+        # Wait briefly for any spawned daemon threads to register
+        pre_compress_threads = [t for t in launched if t.name == "mem0-pre-compress"]
+        assert pre_compress_threads, (
+            "Expected a 'mem0-pre-compress' thread to be launched"
+        )
+
+    def test_extraction_thread_calls_backend_add(self, monkeypatch):
+        """The extraction thread eventually calls backend.add with infer=True."""
+        backend = FakeBackend()
+        provider = self._make_provider(monkeypatch, backend=backend)
+
+        large_content = "FACT " * 200  # well over 500 chars
+        messages = [{"role": "tool", "content": large_content}]
+        provider.on_pre_compress(messages)
+
+        # Give the daemon thread time to run
+        import time
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            calls = [c for c in backend.captured if c[0] == "add"]
+            if calls:
+                break
+            time.sleep(0.05)
+
+        add_calls = [c for c in backend.captured if c[0] == "add"]
+        assert add_calls, "backend.add should have been called by the extraction thread"
+        assert add_calls[0][2]["infer"] is True, "Extraction must use infer=True"
+
+    def test_no_thread_launched_when_tool_content_below_500(self, monkeypatch):
+        """Tool content <= 500 chars does not trigger a background extraction thread."""
+        import threading
+
+        backend = FakeBackend()
+        provider = self._make_provider(monkeypatch, backend=backend)
+
+        small_content = "tiny"  # well below 500
+        messages = [{"role": "tool", "content": small_content}]
+
+        launched: list[threading.Thread] = []
+        original_start = threading.Thread.start
+
+        def capturing_start(self_thread):
+            launched.append(self_thread)
+            original_start(self_thread)
+
+        monkeypatch.setattr(threading.Thread, "start", capturing_start)
+        provider.on_pre_compress(messages)
+
+        pre_compress_threads = [t for t in launched if t.name == "mem0-pre-compress"]
+        assert not pre_compress_threads, (
+            "No extraction thread should launch when content is below the 500-char threshold"
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Backend-is-None short-circuits without launching any thread
+    # ------------------------------------------------------------------
+
+    def test_backend_none_no_thread_launched(self, monkeypatch):
+        """When _backend is None, on_pre_compress returns early and no
+        extraction thread is spawned."""
+        import threading
+
+        provider = self._make_provider(monkeypatch, backend=None)
+
+        large_content = "A" * self._MIN_EXTRACT
+        messages = [{"role": "tool", "content": large_content}]
+
+        launched: list[threading.Thread] = []
+        original_start = threading.Thread.start
+
+        def capturing_start(self_thread):
+            launched.append(self_thread)
+            original_start(self_thread)
+
+        monkeypatch.setattr(threading.Thread, "start", capturing_start)
+        result = provider.on_pre_compress(messages)
+
+        assert result == "", "on_pre_compress should return empty string"
+        pre_compress_threads = [t for t in launched if t.name == "mem0-pre-compress"]
+        assert not pre_compress_threads, (
+            "No thread should be launched when backend is None"
+        )
