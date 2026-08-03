@@ -1717,6 +1717,7 @@ export const ja = defineLocale({
       copyPath: 'パスをコピー',
       removeFromSidebar: 'サイドバーから削除',
       createFailed: 'プロジェクトを作成できませんでした',
+      addFolderFailed: (count: number) => `${count} 個のフォルダーを追加できませんでした`,
       staleBackend:
         'プロジェクトを作成するには Hermes バックエンドを更新してください。バックエンドがこのデスクトップアプリより古いです（設定 → 更新 → バックエンド）。',
       deleteConfirm:
